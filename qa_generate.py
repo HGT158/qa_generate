@@ -1,14 +1,14 @@
 """
-QA 对生成脚本
-输入: 数据预处理后的 data.json (按页切分, 每条含 page_number / raw_text / char_count)
-输出: qa_pairs.jsonl, 每行一条 QA 对, 供下游检索优化使用
+QA 对生成脚本 (markdown 版)
+输入: 单个 .md 文件 (保险公司业务手册)
+输出: qa_pairs.jsonl, 每行一条 QA 对, 格式对齐老师测试集
 
 用法:
-    python generate_qa.py --input data.json --output qa_pairs.jsonl --doc-name 综合意外伤害保险条款
+    python qa_generate.py --input "保司文件2.0/万通/万通缴费指引/内部缴费指引.md" --output qa_pairs.jsonl
+    python qa_generate.py --input xxx.md --output qa_pairs.jsonl --start-id 100
 
 依赖:
-    pip install openai tqdm
-(也可换成任何兼容 OpenAI SDK 的模型,只需改 BASE_URL / MODEL)
+    pip install openai tqdm python-dotenv
 """
 
 import argparse
@@ -22,135 +22,183 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
 
-# 自动加载 .env 文件里的环境变量 (VOLC_API_KEY 等)
 load_dotenv()
 
 # ============== 配置区 ==============
-# 火山引擎方舟 Coding Plan, 兼容 OpenAI SDK
-# key 从 .env 文件加载, 不要写死在代码里
 API_KEY = os.environ.get("VOLC_API_KEY")
 BASE_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
 MODEL = "ark-code-latest"
 
-# 每页生成多少个 QA 对
-QA_PER_PAGE = 6
+# 每个 md 文档生成多少个 QA 对
+QA_PER_DOC = 8
 # 重试次数
 MAX_RETRIES = 3
-# 内容太短的页跳过 (避免给目录页/空白页出题)
-MIN_CHARS = 100
+# 内容太短的 md 跳过 (避免空文档/目录页)
+MIN_CHARS = 200
 # ===================================
 
 
-SYSTEM_PROMPT = """你是一个专业的中文文档 QA 数据标注员。你的任务是基于给定的文档片段,生成高质量的「问题-答案」对,用于训练和评估检索系统。
- 
-## 核心要求:模拟真实用户的提问
- 
-这些问题将被真实用户用来搜索答案。真实用户在搜索框里不会用书面语,而是用日常口语。
-你必须模拟一个**普通人用手机打字提问**的语气,不是写论文、不是法律咨询、不是客服话术。
- 
-### 口语化的具体要求
-1. 不要用"根据本条款"、"按照规定"、"依据合同"这类前缀
-2. 不要用"如何界定"、"何种情形"、"应当如何"这类书面措辞
-3. 用"怎么"、"咋"、"多久"、"啥情况"、"能不能"、"赔不赔"这类大白话
-4. 主语用"我"或省略主语,而不是"被保险人"、"投保人"
-5. 问题里可以带情绪、带场景、带模糊表达,就像真人发愁时随口问的那样
- 
-### 句式多样性要求(重要!)
- 
-口语化 ≠ 句尾加"啊"。真实用户提问的句式非常多样,你必须分散使用以下几类:
- 
-1. **直接陈述句**(不带语气词):"换工作了多久内得通知保险公司"
-2. **疑问助词结尾**:"...吗?" / "...呢?" (少用"啊")
-3. **场景前置**:"我刚出了车祸,要怎么申请理赔"
-4. **担心/困惑式**:"保费没交完出事了不会不赔吧"
-5. **简短关键词式**:"意外险免赔额怎么算"
-6. **第一人称代入**:"我换了高危工作,保险还有效吗"
- 
-**硬性约束**: 一批 QA 中,以"啊"结尾的问题不能超过 1/3。多用其他语气词(吗/呢/吧)或直接不用语气词。
- 
-### 对比示例 (注意句式分布,不要全都"啊"结尾)
- 
-❌ 差(书面化):被保险人因意外伤害事故身故的,保险金给付期限是多少日?
-✅ 好(直接):出意外死了多久内能申请赔钱
- 
-❌ 差:投保人变更职业时应于多少日内通知保险人?
-✅ 好(陈述):换工作了得多久内告诉保险公司
- 
-❌ 差:被保险人接受整容手术导致的医疗费用是否在保障范围内?
-✅ 好(简短问吗):做整容手术受伤了能赔吗
- 
-❌ 差:何种情形下保险人不承担给付保险金责任?
-✅ 好(场景):啥情况保险公司不赔
- 
-❌ 差:保险合同争议的解决方式有哪些?
-✅ 好(担心式):跟保险公司有矛盾了咋办
- 
-❌ 差:申请意外医疗保险金需提交哪些证明材料?
-✅ 好(代入):我看完病去理赔得带啥材料
- 
-❌ 差:保险费未按时交付的法律后果是什么?
-✅ 好(担心式):保费没交完万一出事了是不是就不赔了
- 
-## 其他严格规则
- 
-1. 答案必须能在原文中直接找到或直接推理得出,禁止编造、禁止引入外部知识
-2. 问题必须独立可理解,不要出现"本条款"、"上述"、"该条"等指代词
-3. 答案要简洁完整:能一句话说清楚的不写两句,但关键数字、条件、例外不能丢
-4. 答案可以稍微正式一些(因为是给用户的回答),但避免照抄原文长句
-5. 覆盖多种问题类型,不要全是事实型
- 
-## 问题类型 (尽量分散)
-- factual:      事实型, 问"是什么"
-- numerical:    数值型, 问具体数字、期限、比例
-- conditional:  条件型, 问"什么情况下"
-- enumeration:  列举型, 问"包括哪些"
-- negation:     否定/排除型, 问"哪些不赔/能不能赔"
-- procedural:   流程型, 问"怎么申请/要准备啥"
- 
+# ============== 分类规则 (基于文件名关键词匹配) ==============
+# 顺序敏感: 优先匹配前面的规则
+CATEGORY_RULES = [
+    ("缴费", ["缴费", "繳費", "保费", "保費", "付款", "繳款"]),
+    ("核保", ["核保", "健康"]),
+    ("理赔", ["理赔", "理賠", "赔偿", "賠償"]),
+    ("产品", ["产品", "產品", "条款", "條款", "保单", "保單"]),
+    ("行政规则", ["行政", "操作", "流程", "服务", "服務", "投保", "操作指引", "管理"]),
+    ("案例", ["案例"]),
+]
+DEFAULT_CATEGORY = "一般查询"
+
+
+def classify_doc(doc_filename: str) -> str:
+    """根据文件名关键词匹配业务分类"""
+    name = doc_filename.lower()
+    for category, keywords in CATEGORY_RULES:
+        for kw in keywords:
+            if kw.lower() in name:
+                return category
+    return DEFAULT_CATEGORY
+
+
+def extract_company_from_path(md_path: Path, base_dir: str = "保司文件2.0") -> str:
+    """
+    从 md 文件路径里提取保司名 (即 base_dir 下的第一级子目录)
+    例: .../保司文件2.0/万通/xxx/yyy.md -> 万通
+    如果路径里找不到 base_dir, 退回到取父目录的父目录名
+    """
+    parts = md_path.parts
+    if base_dir in parts:
+        idx = parts.index(base_dir)
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    # 兜底: 用父目录的父目录名 (因为结构通常是 保司名/文档名/xxx.md)
+    if len(md_path.parents) >= 2:
+        return md_path.parents[1].name
+    return "未知保司"
+
+
+def extract_doc_name_from_path(md_path: Path) -> str:
+    """
+    从 md 路径中提取规范的"文档名"
+    实际数据中, md 文件常常都叫 full.md, 真正的文档名在父目录上, 形如:
+        內部繳費指引.pdf-f6385a61-99f1-4c89-95ef-947fae60dcc3/full.md
+        富饶千秋产品手册_2025_01/富饶千秋产品手册_2025_01.md
+
+    策略: 优先使用父目录名, 并去掉常见的后缀杂质 (如 .pdf-uuid)
+    """
+    parent_name = md_path.parent.name
+    # 如果父目录名形如 "xxx.pdf-{uuid}", 去掉 .pdf 及之后的部分
+    # uuid 形如 f6385a61-99f1-4c89-95ef-947fae60dcc3 (8-4-4-4-12)
+    cleaned = re.sub(
+        r"\.pdf-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        "",
+        parent_name,
+        flags=re.IGNORECASE,
+    )
+    # 兜底: 如果父目录名也没意义(比如就叫 "万通" 这种, 即文件直接在保司目录下),
+    # 回退用文件名 stem
+    if not cleaned or cleaned == md_path.parents[1].name:
+        cleaned = md_path.stem
+    return cleaned
+
+
+# ============== Prompt ==============
+SYSTEM_PROMPT = """你是一个专业的保险知识 QA 数据标注员。你正在基于真实的保险公司业务手册(核保/理赔/缴费/行政等)生成 QA 对,用于评估检索系统在保险知识库上的表现。
+
+## 使用场景
+
+这些 QA 是**保险公司新员工/业务员**在工作中查手册时会问的问题。不是消费者闲聊,不是法律咨询,而是**业务工作场景下的快速查询**。
+
+## 问题书写要求
+
+### 1. 必须以保险公司中文名作为前缀
+
+例如: "万通缴费可以使用现金吗?" / "保诚投保人变更流程是怎样的?" / "富卫如何申请保单假期?"
+
+公司名将通过下面的 user prompt 给你, 必须严格使用给定的公司名作为问题开头。
+
+### 2. 问题风格: 简短书面、关键词式
+
+不是网络口语("咋办、啥情况"),也不是法律条款式("根据本规定..."),而是**业务员查手册时直接问出关键词**:
+
+✅ 好: "万通缴费可以使用信用卡吗?"
+✅ 好: "保诚投保人变更需要什么材料?"
+✅ 好: "富卫如何操作保单价值提取?"
+✅ 好: "万通使用港币缴付美元保单的汇率怎么算?"
+
+❌ 不要: "我想问一下万通能不能用现金缴费啊?"  (太啰嗦)
+❌ 不要: "投保人欲变更保单权益人时应当遵循何种程序?"  (太书面)
+❌ 不要: "万通缴费现金?"  (太碎片)
+
+### 3. 长度
+
+8 - 25 个汉字之间最佳。
+
+## 答案书写要求(重要,和之前不同!)
+
+**答案必须是从原文中直接摘取的片段,不要改写、不要归纳、不要翻译繁体字!**
+
+具体要求:
+- 直接复制原文中能回答问题的句子或段落
+- 保留原文的繁体字、专业术语、格式标点
+- 如果原文是列表/编号格式,保留编号
+- 不要用普通话改写繁体内容
+- 不要加"根据..."这种导引语
+- 答案长度: 一般 30-300 字, 太短(< 10 字)说明问题指向不明确, 太长(> 500 字)说明问题太宽泛
+
+## 分类字段
+
+每条 QA 必须打一个分类标签, 从这 7 个里选一个最贴切的:
+- 缴费: 缴费方式、币种、汇率、信用卡、行政费等
+- 核保: 健康核保、疾病评估、核保要求、体检等
+- 理赔: 理赔流程、所需材料、理赔时效等
+- 产品: 产品条款、保障范围、保单内容、产品手册等
+- 行政规则: 投保流程、保单变更、退保、保单服务、操作指引等
+- 案例: 具体案例分析
+- 一般查询: 不属于以上任何一类的通用问题
+
+## 严格规则
+
+1. 答案必须能在原文中直接找到 (字面匹配, 不能编造)
+2. 问题必须独立可理解, 禁止"上述/本条款/前文"等指代词
+3. 一份文档生成的多个问题之间, 主题要尽量分散, 不要重复问同一个点
+
 ## 输出格式
- 
-严格输出 JSON 数组,不要任何额外说明文字、不要 markdown 代码块。每个元素如下:
+
+严格输出 JSON 数组, 不要任何额外说明、不要 markdown 代码块。每个元素如下:
 {
-  "question": "...",
-  "answer": "...",
-  "question_type": "factual|numerical|conditional|enumeration|negation|procedural",
-  "evidence": "原文中支持该答案的片段"
+  "question": "<带保险公司名前缀的问题>",
+  "answer": "<原文片段, 保留原文格式和繁体字>",
+  "category": "<7 个分类之一>",
+  "evidence": "<原文中答案所在的更完整段落, 用于人工核验>"
 }
 """
 
-USER_PROMPT_TEMPLATE = """文档名称: {doc_name}
-当前页码: {page_number}
- 
-当前页内容:
+
+USER_PROMPT_TEMPLATE = """保险公司名: {company}
+文档名称: {doc_filename}
+默认分类(可参考但不必拘泥): {default_category}
+
+文档内容:
 ```
-{current_page_text}
+{md_content}
 ```
- 
-相邻页上下文 (仅供理解跨页内容,不要单独基于这部分出题):
-```
-{neighbor_context}
-```
- 
-请基于「当前页内容」生成 {n} 个 QA 对,类型尽量分散。直接输出 JSON 数组。
+
+请基于以上文档内容, 生成 {n} 个高质量 QA 对。
+
+注意:
+1. 每个问题必须以"{company}"开头
+2. 答案必须从原文直接摘取, 保留繁体字
+3. 多个问题主题要分散
+4. 直接输出 JSON 数组, 不要任何额外文字
 """
 
 
-def build_neighbor_context(pages: list, idx: int, window: int = 1) -> str:
-    """取当前页前后各 window 页的内容作为上下文,缓解跨页切分的语义断裂问题"""
-    parts = []
-    for i in range(max(0, idx - window), min(len(pages), idx + window + 1)):
-        if i == idx:
-            continue
-        parts.append(f"[第{pages[i]['page_number']}页]\n{pages[i]['raw_text']}")
-    return "\n\n".join(parts) if parts else "(无)"
-
-
 def extract_json_array(text: str):
-    """从模型输出中提取 JSON 数组,容错处理 markdown 代码块、前后多余文字"""
-    # 去掉 ```json ... ``` 这种包裹
+    """从模型输出中提取 JSON 数组, 容错处理 markdown 代码块"""
     text = re.sub(r"^```(?:json)?\s*", "", text.strip())
     text = re.sub(r"\s*```$", "", text.strip())
-    # 找到第一个 [ 和最后一个 ]
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1:
@@ -168,7 +216,7 @@ def call_llm(client: OpenAI, system: str, user: str) -> str:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                temperature=0.9,  # 偏高, 让问题表达更口语化、更多样
+                temperature=0.7,
             )
             return resp.choices[0].message.content
         except Exception as e:
@@ -179,87 +227,145 @@ def call_llm(client: OpenAI, system: str, user: str) -> str:
     raise RuntimeError(f"调用 LLM 失败 {MAX_RETRIES} 次: {last_err}")
 
 
-def generate_qa_for_page(
-    client: OpenAI, page: dict, neighbor_context: str, doc_name: str, n: int
-) -> list:
-    user_prompt = USER_PROMPT_TEMPLATE.format(
-        doc_name=doc_name,
-        page_number=page["page_number"],
-        current_page_text=page["raw_text"],
-        neighbor_context=neighbor_context,
-        n=n,
-    )
-    raw = call_llm(client, SYSTEM_PROMPT, user_prompt)
-    try:
-        items = extract_json_array(raw)
-    except Exception as e:
-        print(f"[warn] 第 {page['page_number']} 页 JSON 解析失败,跳过。错误: {e}")
-        return []
-    return items
+VALID_CATEGORIES = {"缴费", "核保", "理赔", "产品", "行政规则", "案例", "一般查询"}
 
 
-def validate_qa(item: dict) -> bool:
-    """基本字段校验,过滤掉残缺数据"""
-    required = {"question", "answer", "question_type", "evidence"}
+def validate_qa(item: dict, company: str) -> tuple:
+    """基本字段校验, 返回 (是否有效, 原因)"""
+    required = {"question", "answer", "category", "evidence"}
     if not required.issubset(item.keys()):
-        return False
+        return False, "字段缺失"
     if not all(isinstance(item[k], str) and item[k].strip() for k in required):
-        return False
-    # 过滤含有指代词的问题
+        return False, "字段为空"
+    # 问题必须以保司名开头
+    if not item["question"].lstrip().startswith(company):
+        return False, f"问题未以「{company}」开头"
+    # 过滤指代词
     bad_refs = ["本条款", "本条", "上述", "该条", "如前所述", "前文", "该项"]
     if any(ref in item["question"] for ref in bad_refs):
-        return False
-    return True
+        return False, "包含指代词"
+    # category 必须合法
+    if item["category"] not in VALID_CATEGORIES:
+        return False, f"非法分类「{item['category']}」"
+    # 答案不能太短 (太短说明 LLM 偷懒了)
+    if len(item["answer"].strip()) < 5:
+        return False, "答案过短"
+    return True, "ok"
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", required=True, help="输入的 data.json 路径")
+    parser.add_argument("--input", required=True, help="输入的 .md 文件路径")
     parser.add_argument("--output", required=True, help="输出的 qa_pairs.jsonl 路径")
     parser.add_argument(
-        "--doc-name", required=True, help="文档名称,会写入 source_doc 字段"
+        "--qa-per-doc",
+        type=int,
+        default=QA_PER_DOC,
+        help=f"每个文档生成多少 QA, 默认 {QA_PER_DOC}",
     )
-    parser.add_argument("--qa-per-page", type=int, default=QA_PER_PAGE)
     parser.add_argument(
-        "--start-id", type=int, default=1, help="qa_id 起始编号,跨多文档时可调"
+        "--start-id", type=int, default=1, help="qa_id 起始编号, 跨多文档批处理时使用"
+    )
+    parser.add_argument(
+        "--base-dir",
+        default="保司文件2.0",
+        help="zip 解压根目录名, 用来从路径里识别保司名",
     )
     args = parser.parse_args()
 
-    pages = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    md_path = Path(args.input)
+    if not md_path.exists():
+        print(f"[错误] 找不到文件: {md_path}")
+        return
+
+    # 1. 读 md 内容
+    md_content = md_path.read_text(encoding="utf-8")
+    if len(md_content) < MIN_CHARS:
+        print(f"[跳过] 文档过短 ({len(md_content)} 字符 < {MIN_CHARS}): {md_path.name}")
+        return
+
+    # 2. 提取保司名 + 文档名 + 分类
+    company = extract_company_from_path(md_path, base_dir=args.base_dir)
+    doc_name = extract_doc_name_from_path(
+        md_path
+    )  # 规范化的文档名 (用于 source_doc / chunk_id)
+    doc_filename = md_path.name  # 实际文件名 (常常是 full.md)
+    default_category = classify_doc(
+        doc_name
+    )  # 用规范化文档名做分类匹配, 而不是 full.md
+
+    print(f"文件: {doc_filename}  (实际路径: {md_path})")
+    print(f"文档名: {doc_name}")
+    print(f"保司: {company}")
+    print(f"预设分类: {default_category}")
+    print(f"内容长度: {len(md_content)} 字符")
+    print()
+
+    # 3. 安全检查: 输出文件已存在
+    output_path = Path(args.output)
+    if output_path.exists() and output_path.stat().st_size > 0:
+        print(f"[警告] 输出文件 {args.output} 已存在且非空。")
+        print(f"  - 如果是批处理累加, 输入 y 继续")
+        print(f"  - 如果是同一文档重跑, 输入 n 后先删除旧文件")
+        choice = input("继续追加? (y/n): ").strip().lower()
+        if choice != "y":
+            print(f"已退出。删除旧文件: Remove-Item {args.output}")
+            return
+
+    # 4. 调用 LLM 生成
     client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    user_prompt = USER_PROMPT_TEMPLATE.format(
+        company=company,
+        doc_filename=doc_name,  # 用规范化的文档名传给 LLM, 不是 full.md
+        default_category=default_category,
+        md_content=md_content,
+        n=args.qa_per_doc,
+    )
 
+    print("正在调用 LLM 生成 QA, 请稍等...")
+    raw = call_llm(client, SYSTEM_PROMPT, user_prompt)
+
+    # 5. 解析
+    try:
+        items = extract_json_array(raw)
+    except Exception as e:
+        print(f"[错误] 解析 JSON 失败: {e}")
+        print("LLM 返回原文:")
+        print(raw[:1000])
+        return
+
+    # 6. 校验 + 写盘
     qa_id = args.start_id
-    total_written = 0
-
-    # 用 'a' 追加模式,挂了重跑也不会丢之前的
+    written = 0
+    rejected = []
     with open(args.output, "a", encoding="utf-8") as fout:
-        for idx, page in enumerate(tqdm(pages, desc="生成 QA")):
-            if page.get("char_count", len(page["raw_text"])) < MIN_CHARS:
+        for item in items:
+            ok, reason = validate_qa(item, company)
+            if not ok:
+                rejected.append((item.get("question", "<无>")[:50], reason))
                 continue
+            record = {
+                "qa_id": f"qa_{qa_id:05d}",
+                "category": item["category"].strip(),
+                "question": item["question"].strip(),
+                "answer": item["answer"].strip(),
+                "source_doc": doc_name,  # 用规范化的文档名, 不是 full.md
+                "source_company": company,
+                "source_chunk_id": f"{company}_{doc_name}",
+                "evidence": item["evidence"].strip(),
+            }
+            fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+            qa_id += 1
+            written += 1
 
-            neighbor = build_neighbor_context(pages, idx, window=1)
-            items = generate_qa_for_page(
-                client, page, neighbor, args.doc_name, args.qa_per_page
-            )
-
-            for item in items:
-                if not validate_qa(item):
-                    continue
-                record = {
-                    "qa_id": f"qa_{qa_id:05d}",
-                    "question": item["question"].strip(),
-                    "answer": item["answer"].strip(),
-                    "question_type": item["question_type"].strip(),
-                    "source_doc": args.doc_name,
-                    "source_page": page["page_number"],
-                    "source_chunk_id": f"{args.doc_name}_page_{page['page_number']}",
-                    "evidence": item["evidence"].strip(),
-                }
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                qa_id += 1
-                total_written += 1
-
-    print(f"完成: 共写入 {total_written} 条 QA, 输出文件: {args.output}")
+    # 7. 报告
+    print()
+    print(f"=== 完成 ===")
+    print(f"成功写入: {written} 条")
+    print(f"被过滤: {len(rejected)} 条")
+    for q, reason in rejected:
+        print(f"  [skip] {reason}: {q}")
+    print(f"输出文件: {args.output}")
 
 
 if __name__ == "__main__":
