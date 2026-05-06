@@ -1,3 +1,6 @@
+.env
 venv/
 __pycache__/
-.env
+*.pyc
+qa_pairs.jsonl
+qa_pairs_sample.jsonl
